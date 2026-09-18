@@ -1,0 +1,85 @@
+name: Build ESP-SparkBot custom firmware
+
+# 触发：推送到 main，或手动 Run workflow
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build esp-sparkbot (xiaozhi-esp32 v2.5.0 + patch)
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:v6.1
+    env:
+      UPSTREAM_REPO: https://github.com/78/xiaozhi-esp32.git
+      UPSTREAM_REF: v2.5.0
+      BOARD: espressif/esp-sparkbot
+      BOARD_NAME: esp-sparkbot
+      PATCH_FILE: esp-sparkbot-custom-tools.patch
+    steps:
+      - name: Checkout build recipe
+        uses: actions/checkout@v4
+        with:
+          path: recipe
+
+      - name: Clone upstream at pinned tag and apply patch
+        shell: bash
+        run: |
+          set -o pipefail
+          git clone --depth 1 --branch "${UPSTREAM_REF}" "${UPSTREAM_REPO}" src
+          cd src
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git am --keep-cr=false "../recipe/${PATCH_FILE}"; then
+            echo "OK: patch applied via git am"
+          else
+            git am --abort || true
+            git apply -v "../recipe/${PATCH_FILE}"
+            echo "OK: patch applied via git apply"
+          fi
+          echo "===== 变更文件 ====="
+          git status --short
+          echo "===== PROJECT_VER（应为 9.9.9，防官方 OTA 覆盖）====="
+          grep -n 'PROJECT_VER' CMakeLists.txt | head -2
+          echo "===== 新增工具自检 ====="
+          grep -oE '"self\.(screen|camera)\.[a-z_]+"' main/boards/espressif/esp-sparkbot/esp_sparkbot_board.cc | sort -u
+          echo "===== 按键阈值宏（单位 mV）====="
+          grep -nE 'SPARKBOT_KEY_(UP|DOWN|PLAY|MENU)_(MIN|MAX)' main/boards/espressif/esp-sparkbot/config.h | head -8
+
+      - name: Build firmware
+        shell: bash
+        run: |
+          cd src
+          source "$IDF_PATH/export.sh"
+          python scripts/build.py "${BOARD}" --name "${BOARD_NAME}"
+
+      - name: Verify output
+        shell: bash
+        run: |
+          ls -la src/build/merged-binary.bin
+          du -h src/build/merged-binary.bin
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xiaozhi-esp-sparkbot-custom-${{ github.sha }}
+          path: src/build/merged-binary.bin
+          if-no-files-found: error
+
+      - name: Publish release asset
+        continue-on-error: true
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: fw-${{ github.run_number }}
+          name: ESP-SparkBot custom firmware #${{ github.run_number }}
+          body: |
+            基线：78/xiaozhi-esp32 @ v2.5.0
+            补丁：esp-sparkbot-custom-tools.patch
+            提交：${{ github.sha }}
+            烧录：鱼易平台，起始地址 0x0，烧录后 NVS 被清空需重新配网
+          files: src/build/merged-binary.bin
