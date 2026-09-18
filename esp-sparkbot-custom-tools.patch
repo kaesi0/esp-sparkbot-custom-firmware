@@ -1,0 +1,1137 @@
+From 043e70051946757dfaaf1b67c56b6aa1a183fb20 Mon Sep 17 00:00:00 2001
+From: dev <dev@local>
+Date: Fri, 18 Sep 2026 15:10:34 +0800
+Subject: [PATCH] =?UTF-8?q?feat(sparkbot):=20=E5=85=A8=E5=B1=8F=E7=BB=98?=
+ =?UTF-8?q?=E5=9B=BE=E5=B1=82=20+=20=E5=AE=9E=E6=97=B6=E5=8F=96=E6=99=AF?=
+ =?UTF-8?q?=20+=20=E9=9D=A2=E6=9D=BF=E6=8C=89=E9=94=AE=EF=BC=8C=E5=B9=B6?=
+ =?UTF-8?q?=E5=90=AF=E7=94=A8=E5=8D=95=E6=9D=BF=E4=BA=91=E7=BC=96=E8=AF=91?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+适用基线：78/xiaozhi-esp32 发布标签 v2.5.0（2026-09-10）
+（同一补丁也可用于 main @ 5d54beb7，仅极少数 hunk 有行偏移）
+
+背景：官方 self.screen.preview_image 是 AddUserOnlyTool，对模型不可见，
+导致「模型念得出图片 URL、但屏幕出不了图」。本补丁不改动 main/mcp_server.cc，
+而是在板级重现能力，做到零侵入、可随时回退。
+
+改动：
+1. display 层新增全屏图层（挂在 lv_layer_top 上，覆盖对话 UI）
+   - ShowFullscreenImage / HideFullscreenImage
+   - Prepare/Get/Present/ReleaseFullscreenImageBuffer（取景用，零拷贝）
+2. esp_video 新增实时取景支持
+   - Capture() 抽出为 CaptureInternal(discard_frames)，取景只丢 1 帧
+   - 新增 CaptureRgb565()，内置 YUYV/UYVY/GREY/RGB24 -> RGB565 转换
+   - 新增 capture_mutex_ 串行化取景与 take_photo，避免 V4L2 缓冲竞争
+   - 抓帧 WARN 日志改为仅拍照模式下打印（取景 10fps 会刷爆日志）
+3. esp-sparkbot 板级新增 4 个 MCP 工具（全部 AddTool，模型可见）
+   - self.screen.show_image / self.screen.hide_image
+   - self.camera.start_viewfinder / self.camera.stop_viewfinder
+   - 图片解码走两级：LVGL（LODEPNG，覆盖 PNG）失败后回退 jpeg_to_image（JPEG）
+     原因：本固件未启用 LVGL 的 JPEG 解码器，而生图服务默认返回 JPEG
+4. 启用面板按键：GPIO1 上的 4 键电阻分压键盘（官方固件此前完全未使用）
+   - MENU 退出全屏图层；PLAY 取景中触发识别、否则等同于对话键
+   - 刻意不用 AdcButton（其内部 ESP_ERROR_CHECK 会让按键初始化失败变砖）
+5. 抬升 PROJECT_VER 至 9.9.9，避免官方 OTA 覆盖自定义固件
+6. CI 只编译 esp-sparkbot 单板（上游会编 177 个变体，极慢且易超时）
+
+原有 7 个底盘工具 + 摄像头翻转工具 + 全局工具全部保留，未做任何删改。
+---
+ .github/workflows/build.yml                   |  42 +-
+ CMakeLists.txt                                |   4 +-
+ main/boards/common/esp_video.cc               | 176 +++++++-
+ main/boards/common/esp_video.h                |  17 +
+ main/boards/espressif/esp-sparkbot/config.h   |  20 +
+ .../esp-sparkbot/esp_sparkbot_board.cc        | 390 ++++++++++++++++++
+ main/display/display.cc                       |   6 +
+ main/display/display.h                        |  28 ++
+ main/display/lcd_display.cc                   | 186 +++++++++
+ main/display/lcd_display.h                    |  20 +
+ 10 files changed, 850 insertions(+), 39 deletions(-)
+
+diff --git a/.github/workflows/build.yml b/.github/workflows/build.yml
+index d98d2c1..a0f2ffd 100644
+--- a/.github/workflows/build.yml
++++ b/.github/workflows/build.yml
+@@ -30,38 +30,20 @@ jobs:
+         run: python -m unittest discover -s scripts/tests -v
+ 
+       - id: select
+-        name: Select variants based on changes
++        name: Select variants to build
+         shell: bash
+         run: |
+-          EVENT_NAME="${{ github.event_name }}"
+-
+-          # push 到 main 分支，编译全部变体
+-          if [[ "$EVENT_NAME" == "push" ]]; then
+-            # Keep the full matrix out of an environment variable. A single
+-            # Linux environment entry is limited to 128 KiB, and the variant
+-            # JSON can exceed that as boards are added.
+-            {
+-              printf 'variants='
+-              python scripts/build.py --list-boards --json
+-            } >> "$GITHUB_OUTPUT"
+-            exit 0
+-          fi
+-
+-          # pull_request 场景
+-          # actions/checkout checks out GitHub's synthetic PR merge commit. Its
+-          # first and second parents are the exact base and head commits used
+-          # for this run, even when the event SHAs are not exposed as refs in
+-          # the job container.
+-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+-          BASE_SHA="HEAD^1"
+-          HEAD_SHA="HEAD^2"
+-          echo "Base: $(git rev-parse "$BASE_SHA"), Head: $(git rev-parse "$HEAD_SHA")"
+-
+-          CHANGED=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
+-          echo -e "Changed files:\n$CHANGED"
+-
+-          SELECTED=$(printf '%s\n' "$CHANGED" | python scripts/build.py --select-changed)
+-          echo "variants=$SELECTED" >> $GITHUB_OUTPUT
++          # [本地补丁] 只构建本 fork 实际使用的板型（esp-sparkbot）。
++          #
++          # 上游行为：push 到 main 时枚举全部变体（当前 177 个）逐个编译，
++          # 耗时极长且极易超时；PR 时按改动文件推断受影响变体，而本 fork 的
++          # 主要改动落在 main/boards/common/ 与 main/display/，会命中「全部变体」。
++          #
++          # 因此这里直接写死单板。新增其它板型时，在数组里追加一份
++          # {board,name,full_name,type,target} 即可，字段值可由
++          #   python scripts/build.py --list-boards --json
++          # 查得。
++          echo 'variants=[{"board":"espressif/esp-sparkbot","name":"esp-sparkbot","full_name":"espressif-esp-sparkbot","type":"esp-sparkbot","target":"esp32s3"}]' >> "$GITHUB_OUTPUT"
+ 
+   build:
+     name: Build ${{ matrix.full_name }}
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 8ae130c..bfde813 100755
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -9,5 +9,7 @@ include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+ # "Trim" the build. Include the minimal set of components, main, and anything it depends on.
+ idf_build_set_property(MINIMAL_BUILD ON)
+ 
+-set(PROJECT_VER "2.5.0")
++# [本地补丁] 抬高固件版本号，避免官方 OTA 把自定义固件覆盖回官方版本。
++# 官方升级逻辑是「服务端报的版本比自己新才升级」，而官方当前版本为 2.5.0。
++set(PROJECT_VER "9.9.9")
+ project(xiaozhi)
+diff --git a/main/boards/common/esp_video.cc b/main/boards/common/esp_video.cc
+index ae7605f..9922682 100644
+--- a/main/boards/common/esp_video.cc
++++ b/main/boards/common/esp_video.cc
+@@ -412,6 +412,19 @@ void EspVideo::SetExplainUrl(const std::string& url, const std::string& token) {
+ }
+ 
+ bool EspVideo::Capture() {
++    // [本地补丁] 保持原行为：丢弃前 2 帧，取第 3 帧（曝光稳定）
++    return CaptureInternal(3);
++}
++
++// [本地补丁] 原 Capture() 的实现体，抽出为可指定丢帧数的版本，供实时取景复用。
++// 取景场景下丢 1 帧即可，以换取更高帧率。
++bool EspVideo::CaptureInternal(int discard_frames) {
++    if (discard_frames < 1) {
++        discard_frames = 1;
++    }
++    // 串行化抓帧：取景循环与 take_photo / describe_now 不能同时操作 V4L2 缓冲
++    std::lock_guard<std::mutex> capture_lock(capture_mutex_);
++
+     if (encoder_thread_.joinable()) {
+         encoder_thread_.join();
+     }
+@@ -422,7 +435,7 @@ bool EspVideo::Capture() {
+         return false;
+     }
+ 
+-    for (int i = 0; i < 3; i++) {
++    for (int i = 0; i < discard_frames; i++) {
+         struct v4l2_buffer buf = {};
+         buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+         buf.memory = V4L2_MEMORY_MMAP;
+@@ -430,7 +443,7 @@ bool EspVideo::Capture() {
+             ESP_LOGE(TAG, "VIDIOC_DQBUF failed");
+             return false;
+         }
+-        if (i == 2) {
++        if (i == discard_frames - 1) {
+             // 保存帧副本到PSRAM
+             if (frame_.data) {
+                 heap_caps_free(frame_.data);
+@@ -448,15 +461,22 @@ bool EspVideo::Capture() {
+                 return false;
+             }
+ 
++            // [本地补丁] 这两条原本是无条件打印的 WARN 日志。实时取景会以约 10fps 调用
++            // 本函数，照打会每秒刷出 10 条警告，既污染日志也拖慢系统。
++            // 因此只在"拍照模式"（discard_frames > 1）下保留告警，取景时静默。
++            if (discard_frames > 1) {
+ #ifdef CONFIG_XIAOZHI_ENABLE_ROTATE_CAMERA_IMAGE
+-            ESP_LOGW(TAG,
+-                     "mmap_buffers_[buf.index].length = %d, sensor_width = %d, sensor_height = %d",
+-                     mmap_buffers_[buf.index].length, sensor_width_, sensor_height_);
++                ESP_LOGW(
++                    TAG,
++                    "mmap_buffers_[buf.index].length = %d, sensor_width = %d, sensor_height = %d",
++                    mmap_buffers_[buf.index].length, sensor_width_, sensor_height_);
+ #else
+-            ESP_LOGW(TAG,
+-                     "mmap_buffers_[buf.index].length = %d, frame.width = %d, frame.height = %d",
+-                     mmap_buffers_[buf.index].length, frame_.width, frame_.height);
++                ESP_LOGW(
++                    TAG,
++                    "mmap_buffers_[buf.index].length = %d, frame.width = %d, frame.height = %d",
++                    mmap_buffers_[buf.index].length, frame_.width, frame_.height);
+ #endif  // CONFIG_XIAOZHI_ENABLE_ROTATE_CAMERA_IMAGE
++            }
+             ESP_LOG_BUFFER_HEXDUMP(TAG, mmap_buffers_[buf.index].start,
+                                    MIN(mmap_buffers_[buf.index].length, 256), ESP_LOG_DEBUG);
+ 
+@@ -1095,3 +1115,143 @@ std::expected<std::string, std::string> EspVideo::Explain(const std::string& que
+         (int)frame_.len, (int)total_sent, (int)remain_stack_size, question.c_str(), result.c_str());
+     return result;
+ }
++
++// ============================================================================
++// [本地补丁] 实时取景支持：把摄像头帧转换成 LVGL 可直接显示的 RGB565（小端）
++// ============================================================================
++namespace {
++
++// YUV（全范围近似）转 RGB565 小端。系数与 esp32-camera 的定点实现同源。
++inline uint16_t yuv_to_rgb565(int y, int u, int v) {
++    int r = y + ((1436 * (v - 128)) >> 10);
++    int g = y - ((352 * (u - 128)) >> 10) - ((731 * (v - 128)) >> 10);
++    int b = y + ((1814 * (u - 128)) >> 10);
++    r = r < 0 ? 0 : (r > 255 ? 255 : r);
++    g = g < 0 ? 0 : (g > 255 ? 255 : g);
++    b = b < 0 ? 0 : (b > 255 ? 255 : b);
++    return static_cast<uint16_t>(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
++}
++
++// 一行打包 YUV422 转 RGB565。uyvy_first=true 时字节序为 U Y V Y，否则为 Y U Y V。
++void yuv422_row_to_rgb565(const uint8_t* src, uint16_t* dst, int width, bool uyvy_first) {
++    for (int x = 0; x < width; x += 2) {
++        const int b0 = src[0], b1 = src[1], b2 = src[2], b3 = src[3];
++        int y0, u, y1, v;
++        if (uyvy_first) {
++            u = b0;
++            y0 = b1;
++            v = b2;
++            y1 = b3;
++        } else {
++            y0 = b0;
++            u = b1;
++            y1 = b2;
++            v = b3;
++        }
++        dst[x] = yuv_to_rgb565(y0, u, v);
++        if (x + 1 < width) {
++            dst[x + 1] = yuv_to_rgb565(y1, u, v);
++        }
++        src += 4;
++    }
++}
++
++}  // namespace
++
++bool EspVideo::CaptureRgb565(uint8_t* out, size_t out_capacity, uint16_t* out_width,
++                             uint16_t* out_height) {
++    if (out == nullptr || out_width == nullptr || out_height == nullptr) {
++        return false;
++    }
++    // 取景只丢 1 帧以保帧率；CAPTURE 的 3 帧丢弃策略留给 take_photo 使用
++    if (!CaptureInternal(1)) {
++        return false;
++    }
++    if (frame_.data == nullptr || frame_.len == 0 || frame_.width == 0 || frame_.height == 0) {
++        ESP_LOGE(TAG, "CaptureRgb565: frame is not ready");
++        return false;
++    }
++
++    const int w = frame_.width;
++    const int h = frame_.height;
++    const size_t need = static_cast<size_t>(w) * static_cast<size_t>(h) * 2;
++    if (out_capacity < need) {
++        ESP_LOGE(TAG, "CaptureRgb565: output buffer too small (%u < %u)", (unsigned)out_capacity,
++                 (unsigned)need);
++        return false;
++    }
++
++    auto* dst = reinterpret_cast<uint16_t*>(out);
++    switch (frame_.format) {
++        case V4L2_PIX_FMT_RGB565:
++            memcpy(out, frame_.data, need);
++            break;
++        case V4L2_PIX_FMT_RGB565X: {
++            const auto* s = reinterpret_cast<const uint16_t*>(frame_.data);
++            const size_t n = static_cast<size_t>(w) * h;
++            for (size_t i = 0; i < n; i++) {
++                dst[i] = __builtin_bswap16(s[i]);
++            }
++            break;
++        }
++        case V4L2_PIX_FMT_YUYV:
++        case V4L2_PIX_FMT_YUV422P: {  // esp_video 1.x 用 YUV422P 表示打包 YUYV
++            const size_t row_bytes = static_cast<size_t>(w) * 2;
++            if (frame_.len < row_bytes * h) {
++                ESP_LOGE(TAG, "CaptureRgb565: YUYV frame truncated (%u bytes)",
++                         (unsigned)frame_.len);
++                return false;
++            }
++            for (int y = 0; y < h; y++) {
++                yuv422_row_to_rgb565(frame_.data + static_cast<size_t>(y) * row_bytes,
++                                     dst + static_cast<size_t>(y) * w, w, false);
++            }
++            break;
++        }
++        case V4L2_PIX_FMT_UYVY: {
++            const size_t row_bytes = static_cast<size_t>(w) * 2;
++            if (frame_.len < row_bytes * h) {
++                ESP_LOGE(TAG, "CaptureRgb565: UYVY frame truncated (%u bytes)",
++                         (unsigned)frame_.len);
++                return false;
++            }
++            for (int y = 0; y < h; y++) {
++                yuv422_row_to_rgb565(frame_.data + static_cast<size_t>(y) * row_bytes,
++                                     dst + static_cast<size_t>(y) * w, w, true);
++            }
++            break;
++        }
++        case V4L2_PIX_FMT_GREY: {
++            const size_t n = static_cast<size_t>(w) * h;
++            if (frame_.len < n) {
++                return false;
++            }
++            for (size_t i = 0; i < n; i++) {
++                const int g = frame_.data[i];
++                dst[i] = static_cast<uint16_t>(((g & 0xF8) << 8) | ((g & 0xFC) << 3) | (g >> 3));
++            }
++            break;
++        }
++        case V4L2_PIX_FMT_RGB24: {
++            const size_t n = static_cast<size_t>(w) * h;
++            if (frame_.len < n * 3) {
++                return false;
++            }
++            for (size_t i = 0; i < n; i++) {
++                const int r = frame_.data[i * 3 + 0];
++                const int g = frame_.data[i * 3 + 1];
++                const int b = frame_.data[i * 3 + 2];
++                dst[i] = static_cast<uint16_t>(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
++            }
++            break;
++        }
++        default:
++            ESP_LOGE(TAG, "CaptureRgb565: unsupported sensor format 0x%08lx",
++                     (unsigned long)frame_.format);
++            return false;
++    }
++
++    *out_width = static_cast<uint16_t>(w);
++    *out_height = static_cast<uint16_t>(h);
++    return true;
++}
+diff --git a/main/boards/common/esp_video.h b/main/boards/common/esp_video.h
+index f36d26a..84a7ce3 100644
+--- a/main/boards/common/esp_video.h
++++ b/main/boards/common/esp_video.h
+@@ -3,6 +3,7 @@
+ 
+ #include <lvgl.h>
+ #include <memory>
++#include <mutex>
+ #include <thread>
+ #include <vector>
+ 
+@@ -42,6 +43,12 @@ private:
+     std::string explain_url_;
+     std::string explain_token_;
+     std::thread encoder_thread_;
++    // [本地补丁] 抓帧互斥：取景线程与 take_photo / describe_now 共用同一路 V4L2 缓冲，
++    // 必须串行化，避免 DQBUF 竞争与 frame_ 被并发覆盖。
++    std::mutex capture_mutex_;
++
++    // [本地补丁] 抓帧公共实现。discard_frames 指定丢弃前几帧（曝光稳定）后取最后一帧。
++    bool CaptureInternal(int discard_frames);
+ 
+ public:
+     EspVideo(const esp_video_init_config_t& config);
+@@ -53,4 +60,14 @@ public:
+     virtual bool SetHMirror(bool enabled) override;
+     virtual bool SetVFlip(bool enabled) override;
+     virtual std::expected<std::string, std::string> Explain(const std::string& question) override;
++
++    // [本地补丁] 抓一帧并转换为 RGB565（小端）写入调用方缓冲，用于实时取景。
++    // out_capacity 必须 >= width*height*2。成功后回填实际尺寸，尺寸取自摄像头输出。
++    // 注意：返回值中的尺寸可能不是显示尺寸，调用方需按需自行缩放/居中。
++    bool CaptureRgb565(uint8_t* out, size_t out_capacity, uint16_t* out_width, uint16_t* out_height);
++    // 摄像头当前输出分辨率（未初始化时为 0）
++    uint16_t frame_width() const { return frame_.width; }
++    uint16_t frame_height() const { return frame_.height; }
++    v4l2_pix_fmt_t frame_format() const { return frame_.format; }
++    bool IsStreaming() const { return streaming_on_; }
+ };
+diff --git a/main/boards/espressif/esp-sparkbot/config.h b/main/boards/espressif/esp-sparkbot/config.h
+index 3c6e6f2..033e778 100644
+--- a/main/boards/espressif/esp-sparkbot/config.h
++++ b/main/boards/espressif/esp-sparkbot/config.h
+@@ -46,6 +46,26 @@
+ #define UART_ECHO_RTS (-1)
+ #define UART_ECHO_CTS (-1)
+ 
++/* ---------------------------------------------------------------------------
++ * [本地补丁] 面板按键
++ *
++ * ESP-SparkBot 面板上的 4 个按键（UP / DOWN / PLAY / MENU）并非电容触摸，
++ * 而是共用 GPIO1 的电阻分压键盘（ADC1_CH0）。以下阈值单位为毫伏，
++ * 取自乐鑫官方 BSP v1.0.1 的 esp_sparkbot_bsp.c，与板上分压电阻一一对应。
++ * 官方固件此前完全没有使用这组按键（只注册了 GPIO0 的 BOOT 键），
++ * 这里把它们接进来，用作全屏图层的退出 / 取景快门的输入通道。
++ * ------------------------------------------------------------------------- */
++#define SPARKBOT_KEY_ADC_GPIO GPIO_NUM_1
++
++#define SPARKBOT_KEY_UP_MIN   280
++#define SPARKBOT_KEY_UP_MAX   480
++#define SPARKBOT_KEY_DOWN_MIN 720
++#define SPARKBOT_KEY_DOWN_MAX 920
++#define SPARKBOT_KEY_PLAY_MIN 1880
++#define SPARKBOT_KEY_PLAY_MAX 2080
++#define SPARKBOT_KEY_MENU_MIN 2310
++#define SPARKBOT_KEY_MENU_MAX 2510
++
+ #define MOTOR_SPEED_MAX 100
+ #define MOTOR_SPEED_80  80
+ #define MOTOR_SPEED_60  60
+diff --git a/main/boards/espressif/esp-sparkbot/esp_sparkbot_board.cc b/main/boards/espressif/esp-sparkbot/esp_sparkbot_board.cc
+index c7c4289..d051c00 100644
+--- a/main/boards/espressif/esp-sparkbot/esp_sparkbot_board.cc
++++ b/main/boards/espressif/esp-sparkbot/esp_sparkbot_board.cc
+@@ -10,14 +10,37 @@
+ #include <driver/i2c_master.h>
+ #include <driver/spi_common.h>
+ #include <driver/uart.h>
++#include <esp_adc/adc_oneshot.h>
++#include <esp_heap_caps.h>
+ #include <esp_lcd_panel_vendor.h>
+ #include <esp_log.h>
++#include <freertos/FreeRTOS.h>
++#include <freertos/task.h>
++
++#include <atomic>
+ #include <cstring>
++#include <memory>
++#include <string>
++#include <utility>
+ 
+ #include "esp_video.h"
++#include "jpg/jpeg_to_image.h"
+ 
+ #define TAG "esp_sparkbot"
+ 
++// ---------------------------------------------------------------------------
++// [本地补丁] 面板按键编号
++// ESP-SparkBot 面板上的 UP / DOWN / PLAY / MENU 四个键共用 GPIO1（ADC1_CH0），
++// 靠电阻分压区间区分，因此每个键需要独立的 button_index。
++// ---------------------------------------------------------------------------
++enum PanelKey : int {
++    kPanelKeyUp = 0,
++    kPanelKeyDown = 1,
++    kPanelKeyPlay = 2,
++    kPanelKeyMenu = 3,
++    kPanelKeyCount = 4,
++};
++
+ class SparkBotEs8311AudioCodec : public Es8311AudioCodec {
+ private:
+ public:
+@@ -48,6 +71,15 @@ private:
+     EspVideo* camera_;
+     light_mode_t light_mode_ = LIGHT_MODE_ALWAYS_ON;
+ 
++    // [本地补丁] 面板按键：4 键共用 ADC1_CH0(GPIO1)，此处保存 4 个按键句柄与回调上下文。
++    // 回调上下文必须是稳定地址，故直接内嵌为成员数组。
++    button_handle_t panel_keys_[kPanelKeyCount] = {};
++    std::pair<EspSparkBot*, int> panel_key_ctx_[kPanelKeyCount] = {};
++
++    // [本地补丁] 实时取景状态
++    std::atomic<bool> viewfinder_running_{false};
++    TaskHandle_t viewfinder_task_ = nullptr;
++
+     void InitializeI2c() {
+         // Initialize I2C peripheral
+         i2c_master_bus_config_t i2c_bus_cfg = {
+@@ -88,6 +120,312 @@ private:
+         });
+     }
+ 
++    // -----------------------------------------------------------------------
++    // [本地补丁] 面板按键初始化（GPIO1 电阻分压键盘，4 键共用 ADC1_CH0）
++    //
++    // 官方固件只注册了 GPIO0 的 BOOT 键，面板上这 4 个键在此之前从未被使用。
++    // 这里刻意直接调用 iot_button_new_adc_device 而不是复用 AdcButton 类：
++    // AdcButton 内部使用 ESP_ERROR_CHECK，ADC 初始化失败会直接 panic 重启；
++    // 而按键属于附加输入，失败时应降级并保留其余功能，不能让设备反复重启。
++    // -----------------------------------------------------------------------
++    void InitializePanelKeys() {
++        button_config_t btn_config = {};
++        btn_config.long_press_time = 2000;
++        btn_config.short_press_time = 0;
++
++        struct KeyDef {
++            int id;
++            uint16_t min_mv;
++            uint16_t max_mv;
++            const char* name;
++        };
++        const KeyDef defs[kPanelKeyCount] = {
++            {kPanelKeyUp, SPARKBOT_KEY_UP_MIN, SPARKBOT_KEY_UP_MAX, "UP"},
++            {kPanelKeyDown, SPARKBOT_KEY_DOWN_MIN, SPARKBOT_KEY_DOWN_MAX, "DOWN"},
++            {kPanelKeyPlay, SPARKBOT_KEY_PLAY_MIN, SPARKBOT_KEY_PLAY_MAX, "PLAY"},
++            {kPanelKeyMenu, SPARKBOT_KEY_MENU_MIN, SPARKBOT_KEY_MENU_MAX, "MENU"},
++        };
++
++        for (const auto& def : defs) {
++            button_adc_config_t adc_config = {};
++            adc_config.unit_id = ADC_UNIT_1;
++            adc_config.adc_channel = ADC_CHANNEL_0;  // GPIO1
++            adc_config.button_index = static_cast<uint8_t>(def.id);
++            adc_config.min = def.min_mv;
++            adc_config.max = def.max_mv;
++
++            panel_key_ctx_[def.id] = {this, def.id};
++            button_handle_t handle = nullptr;
++            esp_err_t err = iot_button_new_adc_device(&btn_config, &adc_config, &handle);
++            if (err != ESP_OK || handle == nullptr) {
++                ESP_LOGW(TAG, "Panel key %s unavailable (err=0x%x), skipped", def.name,
++                         static_cast<unsigned>(err));
++                panel_keys_[def.id] = nullptr;
++                continue;
++            }
++            panel_keys_[def.id] = handle;
++            iot_button_register_cb(
++                handle, BUTTON_SINGLE_CLICK, nullptr,
++                [](void* /*btn*/, void* usr_data) {
++                    auto* ctx = static_cast<std::pair<EspSparkBot*, int>*>(usr_data);
++                    if (ctx != nullptr && ctx->first != nullptr) {
++                        ctx->first->OnPanelKey(ctx->second);
++                    }
++                },
++                &panel_key_ctx_[def.id]);
++            ESP_LOGI(TAG, "Panel key %s ready (%u-%u mV)", def.name,
++                     static_cast<unsigned>(def.min_mv), static_cast<unsigned>(def.max_mv));
++        }
++    }
++
++    // -----------------------------------------------------------------------
++    // [本地补丁] 面板按键事件处理
++    // MENU：退出全屏图层（全屏绘图 / 实时取景）
++    // PLAY：取景中 -> 请模型识别当前画面；否则 -> 等同于按下对话键
++    // UP / DOWN：预留未绑定（避免误触发打断播报）
++    // -----------------------------------------------------------------------
++    void OnPanelKey(int key_id) {
++        switch (key_id) {
++            case kPanelKeyMenu:
++                if (viewfinder_running_.exchange(false)) {
++                    // 取景中：只置标志，由取景线程自行退出并释放画面（非阻塞，不卡按键任务）
++                    ESP_LOGI(TAG, "Panel MENU: stopping viewfinder");
++                } else if (display_ != nullptr && display_->IsFullscreenImageVisible()) {
++                    display_->HideFullscreenImage();
++                    ESP_LOGI(TAG, "Panel MENU: fullscreen image hidden");
++                }
++                break;
++
++            case kPanelKeyPlay:
++                if (viewfinder_running_.load()) {
++                    // 注入一句提问，让模型对当前取景画面调用 take_photo 并语音播报结果。
++                    // 说明：这条链路依赖服务端把 listen/detect 的 text 当作用户提问，
++                    // 官方云是否同语义需实测；不生效时可改用语音直接说"看看这是什么"。
++                    ESP_LOGI(TAG, "Panel PLAY: asking model to describe current frame");
++                    Application::GetInstance().WakeWordInvoke("看看这是什么");
++                } else {
++                    Application::GetInstance().ToggleChatState();
++                }
++                break;
++
++            case kPanelKeyUp:
++            case kPanelKeyDown:
++            default:
++                break;
++        }
++    }
++
++    // -----------------------------------------------------------------------
++    // [本地补丁] 全屏显示一张网络图片
++    // -----------------------------------------------------------------------
++    ToolResult ShowImageFromUrl(const std::string& url) {
++        // 取景与全屏静态图共用同一个图层。若取景线程还没退干净就销毁画面缓冲，
++        // 会造成 use-after-free，因此这里必须确认停止成功后才继续。
++        if (!StopViewfinder()) {
++            return std::unexpected("Real-time viewfinder is still shutting down, please retry");
++        }
++
++        // 官方 preview_image 用的是 3 秒超时，公网图片（尤其首次 TLS 握手）经常不够。
++        // 这里放宽到 15 秒。若图片由内网服务提供 240x240 缩略图，通常几百毫秒即可完成。
++        auto http = Board::GetInstance().GetNetwork()->CreateHttp(15);
++        if (http == nullptr) {
++            return std::unexpected("Failed to create HTTP client");
++        }
++        if (auto opened = http->Open("GET", url); !opened) {
++            return std::unexpected("Failed to open URL: " + url + " (" + opened.error().ToString() +
++                                   ")");
++        }
++        auto status_code = http->GetStatusCode();
++        if (!status_code) {
++            http->Close();
++            return std::unexpected(status_code.error().ToString());
++        }
++        if (*status_code != 200) {
++            http->Close();
++            return std::unexpected("Unexpected status code: " + std::to_string(*status_code));
++        }
++
++        const size_t content_length = http->GetBodyLength();
++        // 上限 1MB：既防止 PSRAM 被单张图撑爆，也隐含要求服务端下发缩略图而非原图
++        constexpr size_t kMaxImageBytes = 1024 * 1024;
++        if (content_length == 0 || content_length > kMaxImageBytes) {
++            http->Close();
++            return std::unexpected("Image size not acceptable: " +
++                                   std::to_string(content_length) +
++                                   " bytes (must be 1..1048576)");
++        }
++
++        using BufferPtr = std::unique_ptr<char, decltype(&heap_caps_free)>;
++        BufferPtr data(static_cast<char*>(heap_caps_malloc(
++                           content_length, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)),
++                       heap_caps_free);
++        if (data == nullptr) {
++            http->Close();
++            return std::unexpected("Out of memory for image download");
++        }
++        size_t total_read = 0;
++        while (total_read < content_length) {
++            auto ret = http->Read(data.get() + total_read, content_length - total_read);
++            if (!ret) {
++                http->Close();
++                return std::unexpected("Failed to download image");
++            }
++            if (*ret == 0) {
++                break;
++            }
++            total_read += *ret;
++        }
++        http->Close();
++
++        // 两级解码：
++        //   1) 先交给 LVGL 解码器（本固件启用了 CONFIG_LV_USE_LODEPNG，覆盖 PNG/BMP 等）
++        //   2) 不行再回退到固件自带的 jpeg_to_image()（输出 RGB565），覆盖 JPEG
++        // 这一步回退不是可选项：本固件没有启用 LVGL 的 JPEG 解码器
++        // （LV_USE_SJPG / LV_USE_TJPGD 均未开启），而 Seedream 等生图服务默认返回 JPEG。
++        std::unique_ptr<LvglAllocatedImage> image;
++        {
++            lv_image_dsc_t probe = {};
++            probe.data_size = total_read;
++            probe.data = reinterpret_cast<uint8_t*>(data.get());
++            lv_image_header_t header = {};
++            if (lv_image_decoder_get_info(&probe, &header) == LV_RESULT_OK) {
++                image = std::make_unique<LvglAllocatedImage>(data.release(), total_read);
++            }
++        }
++        if (image == nullptr) {
++            uint8_t* rgb = nullptr;
++            size_t rgb_len = 0;
++            size_t jw = 0;
++            size_t jh = 0;
++            size_t stride = 0;
++            const esp_err_t jerr = jpeg_to_image(reinterpret_cast<const uint8_t*>(data.get()),
++                                                 total_read, &rgb, &rgb_len, &jw, &jh, &stride);
++            if (jerr != ESP_OK || rgb == nullptr) {
++                return std::unexpected(
++                    "Unsupported image format (this firmware can decode PNG and JPEG only)");
++            }
++            data.reset();  // 压缩数据已无用，解码结果另占一块内存
++            ESP_LOGI(TAG, "JPEG decoded to RGB565: %ux%u stride=%u len=%u", static_cast<unsigned>(jw),
++                     static_cast<unsigned>(jh), static_cast<unsigned>(stride),
++                     static_cast<unsigned>(rgb_len));
++            image = std::make_unique<LvglAllocatedImage>(
++                rgb, rgb_len, static_cast<int>(jw), static_cast<int>(jh), static_cast<int>(stride),
++                LV_COLOR_FORMAT_RGB565);
++        }
++        if (image == nullptr || !image->IsValid()) {
++            return std::unexpected("Failed to decode the downloaded image");
++        }
++        if (display_ == nullptr || !display_->ShowFullscreenImage(std::move(image))) {
++            return std::unexpected("Display does not support fullscreen image");
++        }
++        ESP_LOGI(TAG, "Image shown fullscreen: %u bytes from %s", static_cast<unsigned>(total_read),
++                 url.c_str());
++        return std::string("图片已全屏显示在设备屏幕上");
++    }
++
++    // -----------------------------------------------------------------------
++    // [本地补丁] 实时取景
++    // -----------------------------------------------------------------------
++    static void ViewfinderTaskEntry(void* arg) {
++        static_cast<EspSparkBot*>(arg)->ViewfinderLoop();
++    }
++
++    void ViewfinderLoop() {
++        // 约 10fps：帧率瓶颈在 YUV->RGB565 软件转换与 240x240 SPI 全屏刷新。
++        // 屏幕是 20 行条带局部刷新（见 display/lcd_display.cc），实测 8~12fps 属正常。
++        constexpr int kFrameIntervalMs = 100;
++        while (viewfinder_running_.load()) {
++            size_t buf_size = 0;
++            uint8_t* buf = display_->GetFullscreenImageBuffer(&buf_size);
++            if (buf == nullptr) {
++                ESP_LOGE(TAG, "Viewfinder: frame buffer gone, abort loop");
++                break;
++            }
++            uint16_t out_w = 0;
++            uint16_t out_h = 0;
++            if (camera_->CaptureRgb565(buf, buf_size, &out_w, &out_h)) {
++                display_->PresentFullscreenImageBuffer();
++            } else {
++                ESP_LOGW(TAG, "Viewfinder: capture frame failed");
++                vTaskDelay(pdMS_TO_TICKS(200));
++                continue;
++            }
++            vTaskDelay(pdMS_TO_TICKS(kFrameIntervalMs));
++        }
++
++        // 画面缓冲的释放固定在任务内部完成：这样 StopViewfinder 只需等待任务结束，
++        // 不会出现「主线程已释放缓冲、取景线程还在写入」的 use-after-free。
++        display_->ReleaseFullscreenImageBuffer();
++        viewfinder_task_ = nullptr;
++        ESP_LOGI(TAG, "Viewfinder loop exited");
++        vTaskDelete(nullptr);
++    }
++
++    bool WaitViewfinderExit(int timeout_ms) {
++        int waited = 0;
++        while (viewfinder_task_ != nullptr && waited < timeout_ms) {
++            vTaskDelay(pdMS_TO_TICKS(20));
++            waited += 20;
++        }
++        return viewfinder_task_ == nullptr;
++    }
++
++    ToolResult StartViewfinder() {
++        if (viewfinder_running_.load()) {
++            return std::string("实时取景已经在运行中");
++        }
++        if (!WaitViewfinderExit(5000)) {
++            return std::unexpected("上一次取景任务尚未退出，请稍后再试");
++        }
++        if (camera_ == nullptr || !camera_->IsStreaming()) {
++            return std::unexpected("摄像头未就绪，无法启动取景");
++        }
++        const uint16_t w = camera_->frame_width();
++        const uint16_t h = camera_->frame_height();
++        if (w == 0 || h == 0) {
++            return std::unexpected("摄像头未上报分辨率，无法启动取景");
++        }
++        if (display_ == nullptr || !display_->PrepareFullscreenImageBuffer(w, h)) {
++            return std::unexpected("内存不足，无法为取景画面分配缓冲");
++        }
++
++        viewfinder_running_ = true;
++        // 用局部变量接收句柄：ESP32-S3 是双核，新任务可能在 xTaskCreate 返回前就跑起来，
++        // 若它提前退出会把 viewfinder_task_ 置空，随后被 xTaskCreate 写回覆盖成"任务已存在"
++        // 的假象。先落在局部变量上，等创建函数返回后再赋值给成员，避免这个竞态。
++        TaskHandle_t handle = nullptr;
++        if (xTaskCreate(ViewfinderTaskEntry, "spark_view", 5120, this, 3, &handle) != pdPASS) {
++            viewfinder_running_ = false;
++            display_->ReleaseFullscreenImageBuffer();
++            return std::unexpected("创建取景任务失败");
++        }
++        viewfinder_task_ = handle;
++        ESP_LOGI(TAG, "Viewfinder started: %ux%u", static_cast<unsigned>(w),
++                 static_cast<unsigned>(h));
++        return std::string("实时取景已打开，画面已显示在屏幕上");
++    }
++
++    // 停止取景。返回 true 表示已确认取景线程退出（即画面缓冲已安全释放，不会再有写入者）。
++    //
++    // 注意：这里不能只看 viewfinder_running_ 标志就返回。MENU 键走的是"只置标志、让任务
++    // 自行退出"的路径，此时标志已是 false 但任务可能还在写最后一帧；调用方若据此就销毁
++    // 画面缓冲，会造成 use-after-free。因此只要任务句柄还没清空，就必须等它真正退出。
++    bool StopViewfinder() {
++        const bool was_running = viewfinder_running_.exchange(false);
++        if (!was_running && viewfinder_task_ == nullptr) {
++            return true;
++        }
++        if (!WaitViewfinderExit(5000)) {
++            // 取景线程可能阻塞在 DQBUF 上；此时绝不能由主线程释放缓冲，
++            // 交给该线程退出时自行释放，避免野指针。
++            ESP_LOGE(TAG,
++                     "Viewfinder task did not exit within 5s; buffer will be released by the task");
++            return false;
++        }
++        ESP_LOGI(TAG, "Viewfinder stopped");
++        return true;
++    }
++
+     void InitializeDisplay() {
+         esp_lcd_panel_io_handle_t panel_io = nullptr;
+         esp_lcd_panel_handle_t panel = nullptr;
+@@ -277,6 +615,55 @@ private:
+ 
+                                return true;
+                            });
++
++        // -------------------------------------------------------------------
++        // [本地补丁] 新增工具：全屏绘图层 + 实时取景
++        //
++        // 全部使用 AddTool（对模型可见）。官方原生的 self.screen.preview_image 是
++        // AddUserOnlyTool（仅用户可见、模型看不见），所以会出现"念得出图片网址但屏幕不显示"。
++        // 这里不改动 main/mcp_server.cc，而是在板级重现能力，做到零侵入、可随时回退。
++        // 原有的 7 个底盘工具 + 摄像头翻转工具全部保留，一个未动。
++        // -------------------------------------------------------------------
++        mcp_server.AddTool(
++            "self.screen.show_image",
++            "把一张图片全屏显示在设备的 240x240 屏幕上，图像会一直保持显示，直到调用 "
++            "self.screen.hide_image 或被用户手动关闭。适合画图、展示照片、显示图表等"
++            "需要用户「亲眼看到」的内容。url 必须是设备能直接下载的图片直链（jpg/png）。"
++            "注意：图片会覆盖整个屏幕，包括对话界面。",
++            PropertyList({Property("url", kPropertyTypeString)}),
++            [this](const PropertyList& properties) -> ToolResult {
++                return ShowImageFromUrl(properties["url"].value<std::string>());
++            });
++
++        mcp_server.AddTool("self.screen.hide_image",
++                           "关闭屏幕上的全屏图片或实时取景画面，回到正常的对话界面。",
++                           PropertyList(), [this](const PropertyList&) -> ToolResult {
++                               if (!StopViewfinder()) {
++                                   return std::unexpected(
++                                       "Viewfinder is still shutting down, please retry");
++                               }
++                               if (display_ != nullptr) {
++                                   display_->HideFullscreenImage();
++                               }
++                               return true;
++                           });
++
++        mcp_server.AddTool(
++            "self.camera.start_viewfinder",
++            "打开实时取景：把摄像头的实时画面持续显示在屏幕上，用户能直接看到自己正在对着什么。"
++            "适用于「让我看看」「对准某个东西」「自拍构图」这类请求。"
++            "取景画面会覆盖对话界面，停止请调用 self.camera.stop_viewfinder。",
++            PropertyList(),
++            [this](const PropertyList&) -> ToolResult { return StartViewfinder(); });
++
++        mcp_server.AddTool("self.camera.stop_viewfinder", "关闭实时取景画面。", PropertyList(),
++                           [this](const PropertyList&) -> ToolResult {
++                               if (!StopViewfinder()) {
++                                   return std::unexpected(
++                                       "Viewfinder is still shutting down, please retry");
++                               }
++                               return true;
++                           });
+     }
+ 
+ public:
+@@ -287,6 +674,9 @@ public:
+         InitializeButtons();
+         InitializeCamera();
+         InitializeEchoUart();
++        // [本地补丁] 面板按键（GPIO1 分压键盘）在工具注册之前就绪，
++        // 这样工具一上线用户就能用按键退出全屏图层。
++        InitializePanelKeys();
+         InitializeTools();
+         GetBacklight()->RestoreBrightness();
+     }
+diff --git a/main/display/display.cc b/main/display/display.cc
+index 7ab9a50..14b4f44 100644
+--- a/main/display/display.cc
++++ b/main/display/display.cc
+@@ -19,6 +19,12 @@ Display::~Display() {}
+ 
+ void Display::SetPreviewImage(std::unique_ptr<LvglImage> image) {}
+ 
++// [本地补丁] 全屏图层的默认实现：不支持 GUI 的显示实现直接返回失败，调用方据此降级。
++bool Display::ShowFullscreenImage(std::unique_ptr<LvglImage> image) {
++    (void)image;
++    return false;
++}
++
+ void Display::SetStatus(const char* status) { ESP_LOGW(TAG, "SetStatus: %s", status); }
+ 
+ void Display::ShowNotification(const std::string& notification, int duration_ms) {
+diff --git a/main/display/display.h b/main/display/display.h
+index e7fa6fa..8c33772 100644
+--- a/main/display/display.h
++++ b/main/display/display.h
+@@ -75,6 +75,34 @@ public:
+     }
+     virtual void LoadAssets() {}
+     virtual void SetPreviewImage(std::unique_ptr<LvglImage> image);
++
++    // [本地补丁] 全屏图层：在对话 UI 之上常驻显示内容，用于全屏绘图 / 实时取景。
++    // 默认空实现见 display.cc；只有支持 GUI 的显示实现（LcdDisplay）覆写。
++    // ShowFullscreenImage 接管 image 所有权，成功返回 true。
++    //
++    // 注意：这里只能声明不能内联定义——参数是 unique_ptr<LvglImage>，
++    // 实例化其析构需要 LvglImage 完整类型，而本头文件对 LvglImage 只是前置声明。
++    virtual bool ShowFullscreenImage(std::unique_ptr<LvglImage> image);
++    // 隐藏全屏图层并释放持有内容，恢复到对话界面。
++    virtual void HideFullscreenImage() {}
++    // 取景模式：预分配一块 width*height 的 RGB565 缓冲并创建全屏图像对象。
++    virtual bool PrepareFullscreenImageBuffer(int width, int height) {
++        (void)width;
++        (void)height;
++        return false;
++    }
++    // 取景模式：取得缓冲指针，供摄像头直接写入（零拷贝，避免再占一份 PSRAM）。
++    // 返回 nullptr 表示未准备好。*out_size 回填缓冲字节数。
++    virtual uint8_t* GetFullscreenImageBuffer(size_t* out_size) {
++        (void)out_size;
++        return nullptr;
++    }
++    // 取景模式：一帧数据写完后调用，触发重绘。
++    virtual void PresentFullscreenImageBuffer() {}
++    // 取景模式：释放缓冲与图像对象。
++    virtual void ReleaseFullscreenImageBuffer() {}
++    // 全屏图层当前是否可见。
++    virtual bool IsFullscreenImageVisible() const { return false; }
+     virtual bool SetTextFont(std::shared_ptr<LvglFont> text_font) {
+         (void)text_font;
+         return false;
+diff --git a/main/display/lcd_display.cc b/main/display/lcd_display.cc
+index 3462ac0..738cf60 100644
+--- a/main/display/lcd_display.cc
++++ b/main/display/lcd_display.cc
+@@ -1129,6 +1129,192 @@ void LcdDisplay::ClearChatMessages() {
+ }
+ #endif
+ 
++// ============================================================================
++// [本地补丁] 全屏图层实现
++// 放在两套消息样式（CONFIG_USE_WECHAT_MESSAGE_STYLE）的条件编译之外，
++// 因此与 UI 布局无关：所有对象都挂在 lv_layer_top() 上，天然覆盖对话界面。
++// ============================================================================
++
++void LcdDisplay::DestroyFullscreenImageLocked() {
++    if (fullscreen_image_ != nullptr) {
++        // LV_EVENT_DELETE 回调里会 delete 掉持有的 LvglImage，这里只需删除对象
++        lv_obj_delete(fullscreen_image_);
++        fullscreen_image_ = nullptr;
++    }
++    if (fullscreen_image_buf_ != nullptr) {
++        heap_caps_free(fullscreen_image_buf_);
++        fullscreen_image_buf_ = nullptr;
++    }
++    fullscreen_image_w_ = 0;
++    fullscreen_image_h_ = 0;
++    fullscreen_active_ = false;
++}
++
++bool LcdDisplay::ShowFullscreenImage(std::unique_ptr<LvglImage> image) {
++    if (image == nullptr) {
++        return false;
++    }
++    const lv_img_dsc_t* dsc = image->image_dsc();
++    if (dsc == nullptr || dsc->header.w == 0 || dsc->header.h == 0) {
++        ESP_LOGE(TAG, "ShowFullscreenImage: invalid image descriptor");
++        return false;
++    }
++
++    DisplayLockGuard lock(this);
++    if (!lock) {
++        return false;
++    }
++    // 若已处于取景模式或已有全屏图，先清掉旧的
++    DestroyFullscreenImageLocked();
++
++    lv_obj_t* obj = lv_image_create(lv_layer_top());
++    lv_obj_remove_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
++    lv_obj_set_style_pad_all(obj, 0, 0);
++    lv_obj_set_style_border_width(obj, 0, 0);
++    lv_obj_set_style_outline_width(obj, 0, 0);
++    lv_obj_set_style_radius(obj, 0, 0);
++    lv_obj_set_style_bg_color(obj, lv_color_black(), 0);
++    lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, 0);
++    lv_obj_set_pos(obj, 0, 0);
++    lv_obj_set_size(obj, width_, height_);
++
++    lv_image_set_src(obj, dsc);
++    // STRETCH 让图片 X/Y 双轴缩放铺满整个控件区域，并自动接管 scale/pivot
++    lv_image_set_inner_align(obj, LV_IMAGE_ALIGN_STRETCH);
++
++    // 所有权转移给 LVGL 对象：对象被删除时释放 LvglImage（其析构会释放底层缓冲）
++    LvglImage* raw_image = image.release();
++    lv_obj_add_event_cb(
++        obj,
++        [](lv_event_t* e) {
++            LvglImage* img = static_cast<LvglImage*>(lv_event_get_user_data(e));
++            if (img != nullptr) {
++                delete img;
++            }
++        },
++        LV_EVENT_DELETE, static_cast<void*>(raw_image));
++
++    fullscreen_image_ = obj;
++    fullscreen_active_ = true;
++    ESP_LOGI(TAG, "Fullscreen image shown: %dx%d (src %ldx%ld)", width_, height_,
++             static_cast<long>(dsc->header.w), static_cast<long>(dsc->header.h));
++    return true;
++}
++
++void LcdDisplay::HideFullscreenImage() {
++    DisplayLockGuard lock(this);
++    if (!lock) {
++        return;
++    }
++    DestroyFullscreenImageLocked();
++    ESP_LOGI(TAG, "Fullscreen image hidden");
++}
++
++bool LcdDisplay::PrepareFullscreenImageBuffer(int width, int height) {
++    if (width <= 0 || height <= 0) {
++        return false;
++    }
++    DisplayLockGuard lock(this);
++    if (!lock) {
++        return false;
++    }
++    DestroyFullscreenImageLocked();
++
++    // 帧缓冲放 PSRAM：240x240x2 = 115200 字节，远大于内部 SRAM 可承受范围
++    const size_t buf_size = static_cast<size_t>(width) * static_cast<size_t>(height) * 2;
++    fullscreen_image_buf_ = static_cast<uint8_t*>(
++        heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
++    if (fullscreen_image_buf_ == nullptr) {
++        ESP_LOGE(TAG, "PrepareFullscreenImageBuffer: allocate %u bytes failed", (unsigned)buf_size);
++        return false;
++    }
++    memset(fullscreen_image_buf_, 0, buf_size);
++
++    lv_obj_t* obj = lv_image_create(lv_layer_top());
++    lv_obj_remove_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
++    lv_obj_set_style_pad_all(obj, 0, 0);
++    lv_obj_set_style_border_width(obj, 0, 0);
++    lv_obj_set_style_outline_width(obj, 0, 0);
++    lv_obj_set_style_radius(obj, 0, 0);
++    lv_obj_set_style_bg_color(obj, lv_color_black(), 0);
++    lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, 0);
++    lv_obj_set_pos(obj, 0, 0);
++    lv_obj_set_size(obj, width_, height_);
++
++    // 直接把帧缓冲包装成 LVGL 图像描述符；LVGL 对内置 RGB565 格式不复制数据，
++    // 因此每帧 memcpy 到该缓冲后 invalidate 即可刷新画面。
++    lv_image_dsc_t* dsc = static_cast<lv_image_dsc_t*>(heap_caps_malloc(
++        sizeof(lv_image_dsc_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
++    if (dsc == nullptr) {
++        heap_caps_free(fullscreen_image_buf_);
++        fullscreen_image_buf_ = nullptr;
++        lv_obj_delete(obj);
++        ESP_LOGE(TAG, "PrepareFullscreenImageBuffer: allocate dsc failed");
++        return false;
++    }
++    memset(dsc, 0, sizeof(lv_image_dsc_t));
++    dsc->header.magic = LV_IMAGE_HEADER_MAGIC;
++    dsc->header.cf = LV_COLOR_FORMAT_RGB565;
++    dsc->header.w = static_cast<uint32_t>(width);
++    dsc->header.h = static_cast<uint32_t>(height);
++    dsc->header.stride = static_cast<uint32_t>(width) * 2;
++    dsc->data_size = buf_size;
++    dsc->data = fullscreen_image_buf_;
++
++    lv_image_set_src(obj, dsc);
++    lv_image_set_inner_align(obj, LV_IMAGE_ALIGN_STRETCH);
++
++    // dsc 也随对象一起释放
++    lv_obj_add_event_cb(
++        obj,
++        [](lv_event_t* e) {
++            lv_image_dsc_t* d = static_cast<lv_image_dsc_t*>(lv_event_get_user_data(e));
++            if (d != nullptr) {
++                heap_caps_free(d);
++            }
++        },
++        LV_EVENT_DELETE, static_cast<void*>(dsc));
++
++    fullscreen_image_ = obj;
++    fullscreen_image_w_ = width;
++    fullscreen_image_h_ = height;
++    fullscreen_active_ = true;
++    ESP_LOGI(TAG, "Viewfinder buffer ready: %dx%d (%u bytes in PSRAM)", width, height,
++             (unsigned)buf_size);
++    return true;
++}
++
++uint8_t* LcdDisplay::GetFullscreenImageBuffer(size_t* out_size) {
++    if (out_size != nullptr) {
++        *out_size = fullscreen_image_buf_ != nullptr
++                        ? static_cast<size_t>(fullscreen_image_w_) * fullscreen_image_h_ * 2
++                        : 0;
++    }
++    return fullscreen_image_buf_;
++}
++
++void LcdDisplay::PresentFullscreenImageBuffer() {
++    if (fullscreen_image_ == nullptr) {
++        return;
++    }
++    // 这里不做数据拷贝：摄像头已直接写入 fullscreen_image_buf_，只需标记脏区。
++    // 因此使用非阻塞 Lock，显示忙时直接放弃这一帧。
++    if (!Lock(200)) {
++        return;
++    }
++    lv_obj_invalidate(fullscreen_image_);
++    Unlock();
++}
++
++void LcdDisplay::ReleaseFullscreenImageBuffer() {
++    DisplayLockGuard lock(this);
++    if (!lock) {
++        return;
++    }
++    DestroyFullscreenImageLocked();
++    ESP_LOGI(TAG, "Viewfinder buffer released");
++}
++
+ void LcdDisplay::SetEmotion(const char* emotion) {
+     if (!setup_ui_called_) {
+         ESP_LOGW(TAG, "SetEmotion('%s') called before SetupUI() - emotion will not be displayed!",
+diff --git a/main/display/lcd_display.h b/main/display/lcd_display.h
+index 9f963e9..f522649 100644
+--- a/main/display/lcd_display.h
++++ b/main/display/lcd_display.h
+@@ -33,6 +33,16 @@ protected:
+     std::unique_ptr<LvglImage> preview_image_cached_ = nullptr;
+     bool hide_subtitle_ = false;  // Control whether to hide chat messages/subtitles
+ 
++    // [本地补丁] 全屏图层（挂在 lv_layer_top 上，覆盖对话 UI）
++    lv_obj_t* fullscreen_image_ = nullptr;
++    uint8_t* fullscreen_image_buf_ = nullptr;  // 取景模式下的 RGB565 帧缓冲（PSRAM）
++    int fullscreen_image_w_ = 0;
++    int fullscreen_image_h_ = 0;
++    // 供任意任务无锁查询；不能直接去读 LVGL 对象（LVGL 非线程安全）
++    std::atomic<bool> fullscreen_active_{false};
++
++    void DestroyFullscreenImageLocked();  // 内部使用，调用前须持有显示锁
++
+     void InitializeLcdThemes();
+     virtual bool Lock(int timeout_ms = 0) override;
+     virtual void Unlock() override;
+@@ -54,6 +64,16 @@ public:
+ 
+     // Set whether to hide chat messages/subtitles
+     virtual void SetHideSubtitle(bool hide) override;
++
++    // [本地补丁] 全屏图层接口（详见 display.h 中的说明）
++    virtual bool ShowFullscreenImage(std::unique_ptr<LvglImage> image) override;
++    virtual void HideFullscreenImage() override;
++    virtual bool PrepareFullscreenImageBuffer(int width, int height) override;
++    virtual uint8_t* GetFullscreenImageBuffer(size_t* out_size) override;
++    virtual void PresentFullscreenImageBuffer() override;
++    virtual void ReleaseFullscreenImageBuffer() override;
++    // 任意任务可无锁调用：直接读原子标志，不触碰 LVGL 对象（LVGL 非线程安全）
++    virtual bool IsFullscreenImageVisible() const override { return fullscreen_active_.load(); }
+ };
+ 
+ // SPI LCD display
+-- 
+2.50.1 (Apple Git-155)
+
